@@ -44,6 +44,14 @@
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<key>NSCameraUsageDescription</key>
+	<string>This app uses the camera to detect hidden cameras and IR signals</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>This app saves detection screenshots for analysis</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>processing</string>
+	</array>
 	<true/>
 </dict>
 </plist>
