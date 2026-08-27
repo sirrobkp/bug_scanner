@@ -1,12 +1,33 @@
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 import 'dart:math';
 import 'dart:typed_data';
 import 'dart:async';
 import 'dart:io';
+
+// NOTE ON WHAT THIS SCREEN CAN AND CAN'T DO:
+// Phone camera sensors sit behind an IR-cut filter, so they are not true IR
+// cameras. What this module actually does is two complementary, real
+// heuristics run on the *live* camera stream (no more still-photo polling):
+//   1. IR-LEAK SPOT SCAN: most phone sensors still leak a little near-IR
+//      through the cut filter. In a dark room, an active IR illuminator
+//      (common in cheap hidden cams for night vision) shows up as a small,
+//      steady, disproportionately bright spot in the luma channel. We look
+//      for spatially-isolated brightness spikes relative to their local
+//      surroundings, and require them to persist across several frames at a
+//      stable position (real emitters are steady; sensor noise / motion
+//      artifacts are not) before we ever raise an alert.
+//   2. LENS GLINT SCAN (flashlight mode): shining a light and looking for a
+//      tiny, near-white specular highlight is the standard manual technique
+//      for spotting a hidden lens. We reproduce that: with the flashlight
+//      on, we look for very small, very bright, near-neutral-color points.
+// Neither of these is a certified detector. They reduce false negatives vs.
+// "look for anything reddish" (the original heuristic, which fires on any
+// warm-colored object) and false positives vs. "no temporal check" (the
+// original, which alerted on a single frame). They are still heuristics —
+// treat alerts as "worth a closer manual look," not proof.
 
 class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
@@ -24,29 +45,44 @@ class _CameraScreenState extends State<CameraScreen>
   bool _darkRoom = false;
   bool _irFilter = false;
   bool _flashlightOn = false;
-  double _distance = 2.4;
+  double _distance = 0;
   double _irConfidence = 0;
   double _sensitivity = 0.5;
   bool _isAlert = false;
   int _detectionCount = 0;
-  Timer? _detectionTimer;
   Timer? _simulationTimer;
   String _lastDetected = 'NONE';
   List<DetectionResult> _detections = [];
+
+  // True only when we've fallen back to synthetic data because the camera
+  // could not be initialized. The UI must always make this visible — it is
+  // never mixed silently into real results.
+  bool _isSimulated = false;
+
+  // Frame-processing state for the live image stream.
+  bool _isStreamBusy = false;
+  int _frameCounter = 0;
+  static const int _processEveryNFrames = 4; // throttle: ~5-7fps of analysis at 30fps capture
+  DateTime? _lastAnalysisAt;
+
+  // Rolling history of spike centroids (normalized 0-1 coords) per recent
+  // analyzed frame, used to require temporal persistence before alerting.
+  final List<List<_Spike>> _recentFrameSpikes = [];
+  static const int _persistenceWindow = 6;
+  static const int _persistenceRequired = 4;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _initializeCamera();
-    _startDetectionLoop();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _detectionTimer?.cancel();
     _simulationTimer?.cancel();
+    _stopStreamSafely();
     _cameraController?.dispose();
     super.dispose();
   }
@@ -56,21 +92,42 @@ class _CameraScreenState extends State<CameraScreen>
     if (state == AppLifecycleState.resumed) {
       _initializeCamera();
     } else if (state == AppLifecycleState.paused) {
+      _stopStreamSafely();
       _cameraController?.dispose();
+      _isCameraInitialized = false;
+    }
+  }
+
+  Future<void> _stopStreamSafely() async {
+    try {
+      if (_cameraController?.value.isStreamingImages ?? false) {
+        await _cameraController!.stopImageStream();
+      }
+    } catch (_) {
+      // Already stopped / controller torn down — nothing to do.
     }
   }
 
   Future<void> _initializeCamera() async {
+    _simulationTimer?.cancel();
     try {
       final status = await Permission.camera.request();
       if (status != PermissionStatus.granted) {
         print('Camera permission denied');
+        if (mounted) {
+          setState(() => _isSimulated = true);
+        }
+        _startSimulationMode();
         return;
       }
 
       _cameras = await availableCameras();
       if (_cameras == null || _cameras!.isEmpty) {
         print('No cameras available');
+        if (mounted) {
+          setState(() => _isSimulated = true);
+        }
+        _startSimulationMode();
         return;
       }
 
@@ -83,17 +140,31 @@ class _CameraScreenState extends State<CameraScreen>
         backCamera,
         ResolutionPreset.medium,
         enableAudio: false,
+        // yuv420 on Android gives us direct access to the luma plane, which
+        // is all the spot-scan needs. iOS ignores this and always delivers
+        // bgra8888, which we also handle in _extractFrameSamples.
+        imageFormatGroup: ImageFormatGroup.yuv420,
       );
 
       await _cameraController!.initialize();
-      
+      await _cameraController!.startImageStream(_onCameraFrame);
+
       if (mounted) {
         setState(() {
           _isCameraInitialized = true;
+          _isSimulated = false;
+          _recentFrameSpikes.clear();
+          _detections = [];
+          _isAlert = false;
+          _irConfidence = 0;
+          _lastDetected = 'MONITORING';
         });
       }
     } catch (e) {
       print('Error initializing camera: $e');
+      if (mounted) {
+        setState(() => _isSimulated = true);
+      }
       _startSimulationMode();
     }
   }
@@ -120,16 +191,23 @@ class _CameraScreenState extends State<CameraScreen>
   }
 
   Future<void> _captureScreenshot() async {
+    if (_cameraController == null || !_isCameraInitialized) return;
+    // takePicture() can't run concurrently with the analysis stream on all
+    // platforms, so we pause the stream for the single still capture and
+    // resume it right after — this only happens on an explicit user tap,
+    // never inside the detection loop itself.
+    final wasStreaming = _cameraController!.value.isStreamingImages;
     try {
-      if (_cameraController == null) return;
+      if (wasStreaming) {
+        await _cameraController!.stopImageStream();
+      }
+
       final image = await _cameraController!.takePicture();
-      if (image == null) return;
-      
       final bytes = await image.readAsBytes();
       final dir = await getApplicationDocumentsDirectory();
       final file = File('${dir.path}/detection_${DateTime.now().millisecondsSinceEpoch}.jpg');
       await file.writeAsBytes(bytes);
-      
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -140,207 +218,331 @@ class _CameraScreenState extends State<CameraScreen>
       }
     } catch (e) {
       print('Screenshot error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Could not save screenshot'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+    } finally {
+      if (wasStreaming && _cameraController != null && _isCameraInitialized) {
+        try {
+          await _cameraController!.startImageStream(_onCameraFrame);
+        } catch (e) {
+          print('Could not resume stream: $e');
+        }
+      }
     }
   }
 
-  void _startDetectionLoop() {
-    _detectionTimer?.cancel();
-    _detectionTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) {
-      if (_isCameraInitialized && _cameraController!.value.isStreamingImages) {
-        _detectHiddenCameras();
-      }
+  // Called by the camera plugin for every captured frame. We throttle here
+  // rather than in a separate Timer, so we're always analyzing the *latest*
+  // frame instead of racing a fixed clock against a slow takePicture() call.
+  void _onCameraFrame(CameraImage image) {
+    if (!_isDetecting) return;
+    _frameCounter++;
+    if (_frameCounter % _processEveryNFrames != 0) return;
+    if (_isStreamBusy) return; // drop frame if previous analysis still running
+    _isStreamBusy = true;
+
+    // Do the heavy pixel work off the UI isolate's critical path by yielding
+    // first, so scrolling/animation doesn't stall waiting on analysis.
+    Future(() => _analyzeFrame(image)).whenComplete(() {
+      _isStreamBusy = false;
     });
   }
 
-  Future<void> _detectHiddenCameras() async {
+  void _analyzeFrame(CameraImage image) {
     try {
-      if (!_isCameraInitialized || _cameraController == null) return;
-      
-      final image = await _cameraController!.takePicture();
-      if (image == null) return;
+      final now = DateTime.now();
+      _lastAnalysisAt = now;
 
-      final bytes = await image.readAsBytes();
-      if (bytes.isEmpty) return;
+      final samples = _extractFrameSamples(image);
+      if (samples == null) return;
 
-      final results = await _analyzeImageForIR(bytes);
-      
+      final spotSpikes = _findSpotSpikes(samples);
+      final glintSpikes = _flashlightOn ? _findGlintSpikes(samples) : <_Spike>[];
+
+      final frameSpikes = [...spotSpikes, ...glintSpikes];
+      _recentFrameSpikes.add(frameSpikes);
+      if (_recentFrameSpikes.length > _persistenceWindow) {
+        _recentFrameSpikes.removeAt(0);
+      }
+
+      final persistent = _findPersistentSpikes();
+
+      if (!mounted) return;
       setState(() {
-        _detections = results;
-        if (results.isNotEmpty) {
+        _detections = persistent
+            .map((s) => DetectionResult(
+                  confidence: s.confidence,
+                  position: s.position,
+                  size: s.size,
+                ))
+            .toList();
+
+        if (_detections.isNotEmpty) {
+          final best = _detections.reduce(
+              (a, b) => a.confidence >= b.confidence ? a : b);
           _isAlert = true;
           _detectionCount++;
-          _lastDetected = 'IR SPIKE DETECTED';
-          _irConfidence = results.first.confidence * 100;
+          _lastDetected = _flashlightOn && glintSpikes.isNotEmpty
+              ? 'LENS GLINT DETECTED'
+              : 'IR SPIKE DETECTED';
+          _irConfidence = best.confidence * 100;
+          // Rough proxy only: a larger, brighter apparent spot generally
+          // sits closer to the lens. This is NOT a real distance
+          // measurement (that needs depth/LiDAR hardware) — it's a
+          // relative cue to help the user close in on the source.
+          _distance = (5.0 - (best.size / 30.0) * 4.5).clamp(0.3, 5.0);
         } else {
           _isAlert = false;
-          _irConfidence = _irConfidence * 0.9;
+          _irConfidence = max(0, _irConfidence - 8);
           _lastDetected = 'MONITORING';
         }
       });
     } catch (e) {
-      print('Detection error: $e');
+      print('Frame analysis error: $e');
     }
   }
 
-  Future<List<DetectionResult>> _analyzeImageForIR(Uint8List imageBytes) async {
-    final results = <DetectionResult>[];
-    
-    try {
-      final image = img.decodeImage(imageBytes);
-      if (image == null) return results;
+  // Requires a spike to show up in roughly the same spot across most of the
+  // last few analyzed frames before we trust it. This is what turns a noisy
+  // single-frame color heuristic into something resistant to sensor noise,
+  // camera shake, and momentary reflections.
+  List<_Spike> _findPersistentSpikes() {
+    if (_recentFrameSpikes.length < _persistenceRequired) return [];
 
-      final irSpikes = _findIRSpikes(image);
-      
-      for (final spike in irSpikes) {
-        results.add(DetectionResult(
-          confidence: spike.confidence,
-          position: spike.position,
-          size: spike.size,
+    final latest = _recentFrameSpikes.last;
+    final result = <_Spike>[];
+
+    for (final candidate in latest) {
+      int hits = 0;
+      double confSum = 0;
+      for (final frame in _recentFrameSpikes) {
+        final match = frame.where((s) =>
+            (s.position - candidate.position).distance < 0.08);
+        if (match.isNotEmpty) {
+          hits++;
+          confSum += match.first.confidence;
+        }
+      }
+      if (hits >= _persistenceRequired) {
+        result.add(_Spike(
+          position: candidate.position,
+          size: candidate.size,
+          confidence: (confSum / hits).clamp(0.0, 1.0),
         ));
       }
-    } catch (e) {
-      print('Image analysis error: $e');
     }
-
-    return results;
+    return result;
   }
 
-  List<IRSpike> _findIRSpikes(img.Image image) {
-    final spikes = <IRSpike>[];
-    final threshold = _darkRoom 
-        ? (150 + _sensitivity * 100).toInt() 
-        : (100 + _sensitivity * 100).toInt();
-    
-    final blockSize = 20;
-    for (int y = 0; y < image.height; y += blockSize) {
-      for (int x = 0; x < image.width; x += blockSize) {
-        double avgR = 0, avgG = 0, avgB = 0;
-        int count = 0;
-        
-        for (int dy = 0; dy < blockSize && y + dy < image.height; dy++) {
-          for (int dx = 0; dx < blockSize && x + dx < image.width; dx++) {
-            final pixel = image.getPixel(x + dx, y + dy);
-            avgR += pixel.r;
-            avgG += pixel.g;
-            avgB += pixel.b;
-            count++;
-          }
-        }
-        
-        if (count > 0) {
-          avgR /= count;
-          avgG /= count;
-          avgB /= count;
-          
-          final brightness = (avgR + avgG + avgB) / 3;
-          final isIR = avgR > avgG * 1.5 && avgR > avgB * 1.5;
-          final isBright = brightness > threshold;
-          final isIRFilterMode = _irFilter && brightness > 180 && avgR > 200;
-          
-          if ((isIR && isBright) || isIRFilterMode) {
-            final confidence = _calculateConfidence(avgR, avgG, avgB, brightness);
-            
-            if (confidence > 0.3) {
-              final normalizedX = x / image.width;
-              final normalizedY = y / image.height;
-              final size = (brightness / 255) * 20 + 5;
-              
-              spikes.add(IRSpike(
-                confidence: confidence,
-                position: Offset(normalizedX, normalizedY),
-                size: size,
-              ));
+  // Pulls out normalized luma (and, where cheaply available, chroma) samples
+  // from a raw camera frame, on a downsampled grid, handling both formats
+  // the camera plugin actually delivers: yuv420 (Android) and bgra8888 (iOS).
+  _FrameSamples? _extractFrameSamples(CameraImage image) {
+    const int gridStep = 12; // sample every 12th pixel — plenty for blob-scale detection, and fast
+
+    final width = image.width;
+    final height = image.height;
+    final cols = (width / gridStep).floor();
+    final rows = (height / gridStep).floor();
+    if (cols < 3 || rows < 3) return null;
+
+    final luma = Float32List(cols * rows);
+    final isNeutral = List<bool>.filled(cols * rows, false);
+
+    if (image.format.group == ImageFormatGroup.yuv420 && image.planes.isNotEmpty) {
+      final yPlane = image.planes[0];
+      final yBytes = yPlane.bytes;
+      final yStride = yPlane.bytesPerRow;
+      final yPixelStride = yPlane.bytesPerPixel ?? 1;
+
+      Uint8List? uBytes, vBytes;
+      int uStride = 0, uPixelStride = 1, vStride = 0, vPixelStride = 1;
+      if (image.planes.length >= 3) {
+        uBytes = image.planes[1].bytes;
+        uStride = image.planes[1].bytesPerRow;
+        uPixelStride = image.planes[1].bytesPerPixel ?? 1;
+        vBytes = image.planes[2].bytes;
+        vStride = image.planes[2].bytesPerRow;
+        vPixelStride = image.planes[2].bytesPerPixel ?? 1;
+      }
+
+      for (int gy = 0; gy < rows; gy++) {
+        final py = gy * gridStep;
+        for (int gx = 0; gx < cols; gx++) {
+          final px = gx * gridStep;
+          final yIndex = py * yStride + px * yPixelStride;
+          if (yIndex >= yBytes.length) continue;
+          final y = yBytes[yIndex].toDouble();
+          luma[gy * cols + gx] = y;
+
+          if (uBytes != null && vBytes != null) {
+            final cy = py ~/ 2;
+            final cx = px ~/ 2;
+            final uIndex = cy * uStride + cx * uPixelStride;
+            final vIndex = cy * vStride + cx * vPixelStride;
+            if (uIndex < uBytes.length && vIndex < vBytes.length) {
+              final u = uBytes[uIndex];
+              final v = vBytes[vIndex];
+              // U/V near 128 (neutral chroma) means the pixel is close to
+              // gray/white rather than strongly colored — used for the
+              // "is this a neutral specular glint, not a colored light"
+              // check in the flashlight-glint pass.
+              isNeutral[gy * cols + gx] = (u - 128).abs() < 12 && (v - 128).abs() < 12;
             }
           }
         }
       }
+    } else {
+      // bgra8888 (iOS default streaming format): single plane, 4 bytes/pixel.
+      final plane = image.planes[0];
+      final bytes = plane.bytes;
+      final stride = plane.bytesPerRow;
+      const bytesPerPixel = 4;
+
+      for (int gy = 0; gy < rows; gy++) {
+        final py = gy * gridStep;
+        for (int gx = 0; gx < cols; gx++) {
+          final px = gx * gridStep;
+          final index = py * stride + px * bytesPerPixel;
+          if (index + 2 >= bytes.length) continue;
+          final b = bytes[index].toDouble();
+          final g = bytes[index + 1].toDouble();
+          final r = bytes[index + 2].toDouble();
+          luma[gy * cols + gx] = 0.299 * r + 0.587 * g + 0.114 * b;
+          final maxC = max(r, max(g, b));
+          final minC = min(r, min(g, b));
+          isNeutral[gy * cols + gx] = (maxC - minC) < 24; // low saturation ~= neutral
+        }
+      }
     }
-    
-    return _combineSpikes(spikes);
+
+    return _FrameSamples(cols: cols, rows: rows, luma: luma, isNeutral: isNeutral);
   }
 
-  double _calculateConfidence(double r, double g, double b, double brightness) {
-    double confidence = 0;
-    
-    if (r > g * 1.5 && r > b * 1.5) {
-      confidence += 0.3;
+  // Pass 1: look for small, isolated regions that are much brighter than
+  // their immediate surroundings — the signature of a point IR source
+  // rather than a broad light source like a window or lamp.
+  List<_Spike> _findSpotSpikes(_FrameSamples s) {
+    final spikes = <_Spike>[];
+    final sensitivityBoost = _sensitivity * 40; // 0-40
+    // Dark rooms make any real emitter stand out more starkly, so we can
+    // demand a bigger relative jump before calling it a spike; well-lit
+    // rooms need a lower relative bar but a higher absolute floor so normal
+    // room brightness doesn't trigger constantly.
+    final relativeJumpNeeded = _darkRoom ? 35 + sensitivityBoost : 55 + sensitivityBoost;
+    final absoluteFloor = _darkRoom ? 40.0 : 140.0;
+
+    for (int y = 1; y < s.rows - 1; y++) {
+      for (int x = 1; x < s.cols - 1; x++) {
+        final idx = y * s.cols + x;
+        final v = s.luma[idx];
+        if (v < absoluteFloor) continue;
+
+        double neighborSum = 0;
+        int neighborCount = 0;
+        for (int dy = -2; dy <= 2; dy++) {
+          for (int dx = -2; dx <= 2; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            final ny = y + dy, nx = x + dx;
+            if (ny < 0 || ny >= s.rows || nx < 0 || nx >= s.cols) continue;
+            neighborSum += s.luma[ny * s.cols + nx];
+            neighborCount++;
+          }
+        }
+        if (neighborCount == 0) continue;
+        final neighborAvg = neighborSum / neighborCount;
+        final jump = v - neighborAvg;
+
+        if (jump >= relativeJumpNeeded) {
+          final confidence = (jump / 200).clamp(0.0, 1.0);
+          spikes.add(_Spike(
+            position: Offset(x / s.cols, y / s.rows),
+            size: (v / 255) * 20 + 6,
+            confidence: confidence,
+          ));
+        }
+      }
     }
-    
-    if (brightness > 200) {
-      confidence += 0.3;
-    }
-    
-    if (r > 200 && g < 150 && b < 150) {
-      confidence += 0.2;
-    }
-    
-    if (r > 180 && g > 100 && b < 100) {
-      confidence += 0.2;
-    }
-    
-    if (_irFilter && brightness > 180) {
-      confidence += 0.3;
-    }
-    
-    return confidence.clamp(0, 1);
+    return _mergeNearby(spikes);
   }
 
-  List<IRSpike> _combineSpikes(List<IRSpike> spikes) {
+  // Pass 2: flashlight-assisted lens glint. Real lenses throw back a tiny,
+  // very bright, near-colorless highlight when lit directly — distinct from
+  // pass 1 in that it doesn't care about IR at all, just "small + blown-out
+  // + neutral colored".
+  List<_Spike> _findGlintSpikes(_FrameSamples s) {
+    final spikes = <_Spike>[];
+    for (int y = 0; y < s.rows; y++) {
+      for (int x = 0; x < s.cols; x++) {
+        final idx = y * s.cols + x;
+        final v = s.luma[idx];
+        if (v > 235 && s.isNeutral[idx]) {
+          spikes.add(_Spike(
+            position: Offset(x / s.cols, y / s.rows),
+            size: 8,
+            confidence: 0.5 + (v - 235) / 40,
+          ));
+        }
+      }
+    }
+    return _mergeNearby(spikes).where((s) => s.confidence > 0.3).toList();
+  }
+
+  List<_Spike> _mergeNearby(List<_Spike> spikes) {
     if (spikes.isEmpty) return [];
-    
-    final combined = <IRSpike>[];
-    final sorted = List<IRSpike>.from(spikes)
+    final sorted = List<_Spike>.from(spikes)
       ..sort((a, b) => b.confidence.compareTo(a.confidence));
-    
+    final merged = <_Spike>[];
     for (final spike in sorted) {
-      bool merged = false;
-      for (final existing in combined) {
-        final dx = spike.position.dx - existing.position.dx;
-        final dy = spike.position.dy - existing.position.dy;
-        final distance = sqrt(dx * dx + dy * dy);
-        
-        if (distance < 0.1) {
-          final combinedSpike = IRSpike(
-            confidence: (existing.confidence + spike.confidence) / 2,
+      var wasMerged = false;
+      for (int i = 0; i < merged.length; i++) {
+        if ((spike.position - merged[i].position).distance < 0.06) {
+          merged[i] = _Spike(
             position: Offset(
-              (existing.position.dx + spike.position.dx) / 2,
-              (existing.position.dy + spike.position.dy) / 2,
+              (merged[i].position.dx + spike.position.dx) / 2,
+              (merged[i].position.dy + spike.position.dy) / 2,
             ),
-            size: max(existing.size, spike.size),
+            size: max(merged[i].size, spike.size),
+            confidence: max(merged[i].confidence, spike.confidence),
           );
-          combined.remove(existing);
-          combined.add(combinedSpike);
-          merged = true;
+          wasMerged = true;
           break;
         }
       }
-      if (!merged) {
-        combined.add(spike);
-      }
+      if (!wasMerged) merged.add(spike);
     }
-    
-    return combined.where((spike) => spike.confidence > 0.4).toList();
+    return merged;
   }
 
+  // Fallback ONLY used when the real camera can't be initialized at all
+  // (denied permission, no hardware, plugin failure). The UI banner tied to
+  // _isSimulated makes this visible to the user at all times — it is never
+  // presented as if it were a live reading.
   void _startSimulationMode() {
     _simulationTimer?.cancel();
     _simulationTimer = Timer.periodic(const Duration(milliseconds: 2400), (timer) {
       if (!mounted) return;
-      
+
       final random = Random();
       final spike = random.nextDouble() < 0.15;
-      
+
       setState(() {
         if (spike && _irFilter) {
           _irConfidence = 60 + random.nextDouble() * 25;
           _isAlert = true;
           _detectionCount++;
-          _lastDetected = 'IR SPIKE DETECTED';
+          _lastDetected = 'IR SPIKE DETECTED (SIMULATED)';
         } else {
           _irConfidence = max(0, _irConfidence - random.nextDouble() * 10);
           _isAlert = _irConfidence > 60;
           if (!_isAlert) {
-            _lastDetected = 'MONITORING';
+            _lastDetected = 'MONITORING (SIMULATED)';
           }
         }
         _distance = 0.5 + random.nextDouble() * 4.5;
@@ -439,9 +641,6 @@ class _CameraScreenState extends State<CameraScreen>
                   CameraPreview(_cameraController!)
                 else
                   _buildPlaceholderFeed(),
-                
-                if (_irFilter && _isAlert)
-                  ..._buildIRBlobs(),
                 
                 ..._buildDetectionMarkers(),
                 
@@ -793,48 +992,58 @@ class _CameraScreenState extends State<CameraScreen>
   }
 
   Widget _buildPlaceholderFeed() {
-    return Container(
-      decoration: const BoxDecoration(
-        gradient: RadialGradient(
-          center: Alignment(0.3, 0.4),
-          radius: 0.8,
-          colors: [
-            Color.fromRGBO(0, 20, 10, 0.8),
-            Color.fromRGBO(0, 10, 5, 0.9),
-          ],
-        ),
-      ),
+    return GestureDetector(
+      onTap: _initializeCamera,
       child: Container(
         decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
+          gradient: RadialGradient(
+            center: Alignment(0.3, 0.4),
+            radius: 0.8,
             colors: [
-              Color(0xFF040810),
-              Color(0xFF060C08),
-              Color(0xFF08080C),
+              Color.fromRGBO(0, 20, 10, 0.8),
+              Color.fromRGBO(0, 10, 5, 0.9),
             ],
           ),
         ),
-        child: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(
-                Icons.camera_alt_outlined,
-                size: 50,
-                color: Colors.white.withOpacity(0.3),
-              ),
-              const SizedBox(height: 10),
-              Text(
-                'Camera not available\nTap to retry',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Colors.white.withOpacity(0.3),
+        child: Container(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [
+                Color(0xFF040810),
+                Color(0xFF060C08),
+                Color(0xFF08080C),
+              ],
+            ),
+          ),
+          child: Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  _isSimulated ? Icons.warning_amber_rounded : Icons.camera_alt_outlined,
+                  size: 50,
+                  color: _isSimulated
+                      ? const Color(0xFFFFB800).withOpacity(0.8)
+                      : Colors.white.withOpacity(0.3),
                 ),
-              ),
-            ],
+                const SizedBox(height: 10),
+                Text(
+                  _isSimulated
+                      ? 'CAMERA UNAVAILABLE\nShowing simulated data — not a real scan\nTap to retry'
+                      : 'Camera not available\nTap to retry',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: _isSimulated ? FontWeight.w700 : FontWeight.normal,
+                    color: _isSimulated
+                        ? const Color(0xFFFFB800)
+                        : Colors.white.withOpacity(0.3),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -1091,50 +1300,6 @@ class _CameraScreenState extends State<CameraScreen>
     }).toList();
   }
 
-  List<Widget> _buildIRBlobs() {
-    final screenHeight = MediaQuery.of(context).size.height * 0.55;
-    final screenWidth = MediaQuery.of(context).size.width;
-    
-    final blobs = [
-      {'top': 0.28, 'left': 0.42, 'size': 18.0},
-      {'top': 0.55, 'left': 0.20, 'size': 10.0},
-      {'top': 0.15, 'left': 0.75, 'size': 12.0},
-    ];
-    
-    return blobs.map((b) {
-      return Positioned(
-        top: (b['top'] as double) * screenHeight,
-        left: (b['left'] as double) * screenWidth,
-        child: TweenAnimationBuilder(
-          duration: const Duration(milliseconds: 1500),
-          tween: Tween<double>(begin: 0.5, end: 1.0),
-          builder: (context, value, child) {
-            final size = (b['size'] as double) * (0.5 + value * 0.5);
-            return Container(
-              width: size,
-              height: size,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: const Color(0xFFFF2244).withOpacity(0.3),
-                boxShadow: [
-                  BoxShadow(
-                    color: const Color(0xFFFF2244),
-                    blurRadius: 20,
-                  ),
-                  BoxShadow(
-                    color: const Color(0xFFFF2244).withOpacity(0.3),
-                    blurRadius: 40,
-                  ),
-                ],
-              ),
-            );
-          },
-          child: null,
-        ),
-      );
-    }).toList();
-  }
-
   Widget _buildToggleCard({
     required String title,
     required bool value,
@@ -1213,6 +1378,32 @@ class IRSpike {
     required this.confidence,
     required this.position,
     required this.size,
+  });
+}
+
+/// Internal candidate spike found in a single frame, before temporal
+/// persistence filtering is applied.
+class _Spike {
+  final Offset position; // normalized 0-1
+  final double size;
+  final double confidence;
+
+  _Spike({required this.position, required this.size, required this.confidence});
+}
+
+/// Downsampled luma (+coarse neutrality) grid extracted from one camera
+/// frame, in whatever raw format the platform delivered.
+class _FrameSamples {
+  final int cols;
+  final int rows;
+  final Float32List luma;
+  final List<bool> isNeutral;
+
+  _FrameSamples({
+    required this.cols,
+    required this.rows,
+    required this.luma,
+    required this.isNeutral,
   });
 }
 

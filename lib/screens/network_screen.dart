@@ -1,5 +1,58 @@
 import 'package:flutter/material.dart';
+import 'package:network_info_plus/network_info_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'dart:async';
+import 'dart:io';
 import 'dart:math';
+
+// NOTE ON WHAT A PHONE CAN ACTUALLY DISCOVER ON A LAN:
+// - There is no cross-platform "list nearby WiFi networks/SSIDs" API for
+//   ordinary apps. iOS in particular does not allow third-party apps to scan
+//   nearby access points at all. What we CAN do — and what this screen now
+//   does — is discover devices on the LAN you're already connected to, by
+//   sweeping the /24 subnet with TCP connection attempts.
+// - Real ICMP ping isn't available from Dart without native/root code, so
+//   "is this host alive" is inferred from TCP behavior on a handful of
+//   common ports (an open port, or even an actively refused connection,
+//   proves the host exists; a timeout is inconclusive, not proof of
+//   absence). Quiet hosts that don't answer any probed port can be missed —
+//   that's an inherent limit of a portable, non-root scan, not a bug.
+// - Per-device MAC addresses are OS-restricted: iOS never exposes them to
+//   apps, and modern Android mostly doesn't either. We best-effort read
+//   /proc/net/arp on Android (works only for hosts already in the kernel's
+//   ARP cache, and only on some devices/OS versions) and are explicit in
+//   the UI when we don't have it, rather than showing a fabricated value.
+// - "Signal" for OTHER devices' WiFi RSSI is not obtainable by a phone at
+//   all (a client only knows its own signal to the access point, never
+//   another client's). We repurpose that same bar indicator to show scan
+//   response latency instead — a real, measured signal, just a different
+//   one — and say so below.
+// - Vendor-from-MAC (OUI) lookup uses a small local table of prefixes
+//   relevant to common routers/phones and to chipsets often found in cheap
+//   IP/hidden cameras (e.g. Espressif, Hi-Silicon/Xiongmai-style DVR
+//   boards). It is not exhaustive.
+
+/// Ports commonly exposed by cheap IP cameras / DVR boards. A hit here is a
+/// heuristic signal worth a manual look, not proof of a hidden camera —
+/// legitimate devices (NAS boxes, printers, routers) sometimes share these.
+const Set<int> _cameraTypicalPorts = {554, 8554, 34567, 37777, 9000, 8081};
+
+/// Broader set of ports we probe per host to decide "is this host alive".
+const List<int> _probePorts = [
+  80, 443, 8080, 8081, 554, 8554, 34567, 37777, 9000, 23, 22, 445, 62078,
+];
+
+const Map<String, String> _ouiVendors = {
+  '24:6F:28': 'Espressif (ESP32)',
+  '30:AE:A4': 'Espressif (ESP32)',
+  'EC:FA:BC': 'Espressif (ESP32)',
+  '8C:CE:4E': 'Xiongmai/Hi-Silicon DVR chipset',
+  '00:12:12': 'Hi-Silicon DVR chipset',
+  'A4:91:B1': 'Cisco',
+  'F8:4D:89': 'Apple',
+  '3C:5A:B4': 'Google',
+  '00:1A:2B': 'Samsung',
+};
 
 class Device {
   final String id;
@@ -7,9 +60,11 @@ class Device {
   final String ip;
   final String mac;
   final String type;
-  final int signal;
+  final int signal; // bucketed from measured TCP response latency, see note above
   final bool threat;
   final String vendor;
+  final List<int> openPorts;
+  final String? reason; // why this device was flagged, shown in the detail panel
 
   Device({
     required this.id,
@@ -20,6 +75,8 @@ class Device {
     required this.signal,
     required this.threat,
     required this.vendor,
+    this.openPorts = const [],
+    this.reason,
   });
 }
 
@@ -75,106 +132,235 @@ class NetworkScreen extends StatefulWidget {
 
 class _NetworkScreenState extends State<NetworkScreen> {
   String? _selectedId;
-  double _scanProgress = 100;
+  double _scanProgress = 0;
   bool _scanning = false;
-  int _packetCount = 14872;
-  late List<Device> _devices;
+  String? _scanError;
+  String? _ssid;
+  DateTime? _lastScanAt;
+  List<Device> _devices = [];
+
+  final Map<String, String> _arpCache = {};
 
   @override
   void initState() {
     super.initState();
-    _devices = [
-      Device(
-        id: '1',
-        name: 'ROUTER-MAIN',
-        ip: '192.168.1.1',
-        mac: 'A4:91:B1:2C:3F:00',
-        type: 'Router',
-        signal: -38,
-        threat: false,
-        vendor: 'Cisco',
-      ),
-      Device(
-        id: '2',
-        name: 'UNKNOWN_DEV_77',
-        ip: '192.168.1.77',
-        mac: 'DE:AD:BE:EF:CA:FE',
-        type: 'Unknown',
-        signal: -62,
-        threat: true,
-        vendor: '???',
-      ),
-      Device(
-        id: '3',
-        name: 'iPhone-ProMax',
-        ip: '192.168.1.12',
-        mac: 'F8:4D:89:3A:1B:CC',
-        type: 'Mobile',
-        signal: -44,
-        threat: false,
-        vendor: 'Apple',
-      ),
-      Device(
-        id: '4',
-        name: 'SmartTV-4K',
-        ip: '192.168.1.34',
-        mac: '00:1A:2B:3C:4D:5E',
-        type: 'IoT',
-        signal: -71,
-        threat: false,
-        vendor: 'Samsung',
-      ),
-      Device(
-        id: '5',
-        name: 'ESP32_CAM_01',
-        ip: '192.168.1.99',
-        mac: '24:6F:28:AA:BB:CC',
-        type: 'IoT',
-        signal: -55,
-        threat: true,
-        vendor: 'Espressif',
-      ),
-    ];
-    
-    _simulatePackets();
+    _startScan();
   }
 
-  void _simulatePackets() {
-    Future.delayed(const Duration(milliseconds: 800), () {
-      if (!mounted) return;
-      setState(() {
-        _packetCount += Random().nextInt(40);
-      });
-      _simulatePackets();
-    });
+  /// Best-effort MAC lookup on Android via the kernel ARP cache. Only finds
+  /// entries the OS has already talked to; frequently empty on modern
+  /// Android builds due to platform sandboxing, and always empty on iOS —
+  /// that's a platform restriction, not something fixable from Dart.
+  Future<void> _loadArpTable() async {
+    _arpCache.clear();
+    if (!Platform.isAndroid) return;
+    try {
+      final file = File('/proc/net/arp');
+      if (!await file.exists()) return;
+      final lines = await file.readAsLines();
+      for (final line in lines.skip(1)) {
+        final parts = line.trim().split(RegExp(r'\s+'));
+        if (parts.length >= 4) {
+          final ip = parts[0];
+          final mac = parts[3].toUpperCase();
+          if (mac != '00:00:00:00:00:00' && mac.contains(':')) {
+            _arpCache[ip] = mac;
+          }
+        }
+      }
+    } catch (_) {
+      // Not readable on this device/OS version — expected in many cases.
+    }
   }
 
-  void _startScan() {
+  String? _vendorFromMac(String? mac) {
+    if (mac == null || mac.length < 8) return null;
+    final prefix = mac.substring(0, 8).toUpperCase();
+    return _ouiVendors[prefix];
+  }
+
+  Future<String?> _resolveSsid(NetworkInfo info) async {
+    try {
+      if (Platform.isAndroid) {
+        // SSID is treated as location-adjacent data pre-Android 13.
+        var status = await Permission.locationWhenInUse.status;
+        if (!status.isGranted) {
+          status = await Permission.locationWhenInUse.request();
+        }
+        if (!status.isGranted) return null;
+      }
+      final ssid = await info.getWifiName();
+      if (ssid == null) return null;
+      return ssid.replaceAll('"', '');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  int _latencyToSignalBucket(int elapsedMs, {required bool responded}) {
+    // Not real RF signal strength (see file header note) — a coarse,
+    // real-measurement-based stand-in so the existing bar indicator still
+    // means something rather than being random.
+    if (!responded) return -85;
+    if (elapsedMs < 60) return -35;
+    if (elapsedMs < 150) return -50;
+    if (elapsedMs < 300) return -65;
+    return -78;
+  }
+
+  Future<Device?> _probeHost(String ip, {required bool isSelf}) async {
+    final openPorts = <int>[];
+    bool hostAlive = isSelf;
+    final stopwatch = Stopwatch()..start();
+
+    await Future.wait(_probePorts.map((port) async {
+      try {
+        final socket = await Socket.connect(
+          ip,
+          port,
+          timeout: const Duration(milliseconds: 350),
+        );
+        hostAlive = true;
+        openPorts.add(port);
+        await socket.close();
+      } on SocketException catch (e) {
+        final msg = e.osError?.message.toLowerCase() ?? e.message.toLowerCase();
+        if (msg.contains('refused')) {
+          // Actively refused means something is there, just not listening
+          // on this particular port.
+          hostAlive = true;
+        }
+      } catch (_) {
+        // Timeout / unreachable — inconclusive for this port, try the rest.
+      }
+    }));
+    stopwatch.stop();
+
+    if (!hostAlive) return null;
+
+    String? hostname;
+    if (!isSelf) {
+      try {
+        final resolved = await InternetAddress(ip)
+            .reverse()
+            .timeout(const Duration(milliseconds: 400));
+        if (resolved.host.isNotEmpty && resolved.host != ip) {
+          hostname = resolved.host;
+        }
+      } catch (_) {
+        // No PTR record / no local mDNS responder — common and not itself
+        // suspicious on most home networks.
+      }
+    }
+
+    final mac = _arpCache[ip];
+    final ouiVendor = _vendorFromMac(mac);
+    openPorts.sort();
+    final looksLikeCameraPort = openPorts.any((p) => _cameraTypicalPorts.contains(p));
+    final looksLikeCameraVendor = ouiVendor?.toLowerCase().contains('esp') == true ||
+        ouiVendor?.toLowerCase().contains('dvr') == true;
+
+    String? reason;
+    final threat = !isSelf && hostname == null && (looksLikeCameraPort || looksLikeCameraVendor);
+    if (threat) {
+      final bits = <String>[];
+      if (hostname == null) bits.add('no resolvable hostname');
+      if (looksLikeCameraPort) {
+        bits.add('camera-typical port(s) open (${openPorts.where((p) => _cameraTypicalPorts.contains(p)).join(', ')})');
+      }
+      if (looksLikeCameraVendor) bits.add('MAC vendor matches a common camera-module chipset');
+      reason = '${bits.join(' + ')}. Worth a manual look — not confirmed.';
+    }
+
+    return Device(
+      id: ip,
+      name: isSelf ? 'THIS DEVICE' : (hostname ?? 'UNKNOWN_${ip.split('.').last}'),
+      ip: ip,
+      mac: mac ?? 'Not available (OS-restricted)',
+      type: isSelf
+          ? 'This Device'
+          : (looksLikeCameraPort ? 'Possible Camera' : (openPorts.isEmpty ? 'Unresponsive' : 'Device')),
+      signal: _latencyToSignalBucket(stopwatch.elapsedMilliseconds, responded: true),
+      threat: threat,
+      vendor: ouiVendor ?? (isSelf ? 'This device' : 'Unknown'),
+      openPorts: openPorts,
+      reason: reason,
+    );
+  }
+
+  Future<void> _startScan() async {
     setState(() {
       _scanning = true;
       _scanProgress = 0;
+      _scanError = null;
     });
-    
-    double p = 0;
-    Future.doWhile(() async {
-      await Future.delayed(const Duration(milliseconds: 80));
-      p += 2 + Random().nextDouble() * 3;
-      setState(() {
-        _scanProgress = min(100, p);
+
+    try {
+      final info = NetworkInfo();
+      await _loadArpTable();
+      final ssid = await _resolveSsid(info);
+      final wifiIp = await info.getWifiIP();
+
+      if (wifiIp == null || wifiIp.isEmpty) {
+        throw Exception('Not connected to a WiFi network');
+      }
+
+      final octets = wifiIp.split('.');
+      if (octets.length != 4) {
+        throw Exception('Unexpected local IP format: $wifiIp');
+      }
+      final subnetPrefix = '${octets[0]}.${octets[1]}.${octets[2]}';
+      final selfLastOctet = int.tryParse(octets[3]) ?? -1;
+
+      const totalHosts = 254;
+      const batchSize = 24;
+      final found = <Device>[];
+      int completed = 0;
+
+      for (int batchStart = 1; batchStart <= totalHosts; batchStart += batchSize) {
+        final batchEnd = min(batchStart + batchSize - 1, totalHosts);
+        final futures = <Future<Device?>>[];
+        for (int i = batchStart; i <= batchEnd; i++) {
+          futures.add(_probeHost('$subnetPrefix.$i', isSelf: i == selfLastOctet));
+        }
+        final results = await Future.wait(futures);
+        for (final d in results) {
+          if (d != null) found.add(d);
+        }
+        completed += (batchEnd - batchStart + 1);
+        if (mounted) {
+          setState(() => _scanProgress = (completed / totalHosts * 100).clamp(0, 100));
+        }
+      }
+
+      found.sort((a, b) {
+        if (a.type == 'This Device') return -1;
+        if (b.type == 'This Device') return 1;
+        return a.ip.compareTo(b.ip);
       });
-      return p < 100;
-    }).then((_) {
+
+      if (mounted) {
+        setState(() {
+          _devices = found;
+          _ssid = ssid;
+          _scanning = false;
+          _lastScanAt = DateTime.now();
+        });
+      }
+    } catch (e) {
       if (mounted) {
         setState(() {
           _scanning = false;
+          _scanError = e.toString().replaceFirst('Exception: ', '');
         });
       }
-    });
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final threats = _devices.where((d) => d.threat).length;
+    final openPortsTotal = _devices.fold<int>(0, (sum, d) => sum + d.openPorts.length);
 
     return Container(
       color: const Color(0xFF0D0D0D),
@@ -260,8 +446,8 @@ class _NetworkScreenState extends State<NetworkScreen> {
               children: [
                 _buildStatItem('DEVICES', _devices.length.toString(), false),
                 _buildStatItem('THREATS', threats.toString(), true),
-                _buildStatItem('PACKETS', '${(_packetCount / 1000).toStringAsFixed(1)}K', false),
-                _buildStatItem('SSID', '2.4G', false),
+                _buildStatItem('OPEN PORTS', openPortsTotal.toString(), false),
+                _buildStatItem('SSID', _ssid ?? 'N/A', false),
               ],
             ),
           ),
@@ -358,7 +544,35 @@ class _NetworkScreenState extends State<NetworkScreen> {
           
           // Device list
           Expanded(
-            child: SingleChildScrollView(
+            child: (_devices.isEmpty && !_scanning)
+                ? Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            _scanError != null ? Icons.wifi_off : Icons.search,
+                            size: 36,
+                            color: Colors.white.withOpacity(0.25),
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            _scanError != null
+                                ? 'Scan failed: $_scanError'
+                                : 'No devices found on this network yet.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: Colors.white.withOpacity(0.4),
+                              letterSpacing: 0.4,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  )
+                : SingleChildScrollView(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               child: Column(
                 children: _devices.map((device) {
@@ -537,9 +751,9 @@ class _NetworkScreenState extends State<NetworkScreen> {
                                         ),
                                         borderRadius: BorderRadius.circular(5),
                                       ),
-                                      child: const Text(
-                                        '⚠ Unrecognised device — possible rogue AP or hidden sensor. Consider blocking.',
-                                        style: TextStyle(
+                                      child: Text(
+                                        '⚠ ${device.reason ?? 'Unrecognised device — worth a manual look.'}',
+                                        style: const TextStyle(
                                           fontSize: 8,
                                           color: Color(0xFFFF2244),
                                           height: 1.4,
