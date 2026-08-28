@@ -49,9 +49,14 @@
     <string>This app uses the camera to detect hidden cameras and IR signals</string>
     <key>NSPhotoLibraryAddUsageDescription</key>
     <string>This app saves detection screenshots for analysis</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>This app requires Bluetooth access to scan for nearby wireless bugs and hidden electronic devices.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>This app requires Bluetooth access to scan for nearby wireless bugs and hidden electronic devices.</string>
     <key>UIBackgroundModes</key>
     <array>
         <string>processing</string>
+        <string>bluetooth-central</string>
     </array>
 </dict>
 </plist>
