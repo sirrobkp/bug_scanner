@@ -1,11 +1,62 @@
 import 'package:flutter/material.dart';
+import 'package:sensors_plus/sensors_plus.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:network_info_plus/network_info_plus.dart';
+import 'package:audioplayers/audioplayers.dart';
+import 'dart:async';
 import 'dart:math';
 
+// NOTE ON WHAT THIS SCREEN CAN ACTUALLY MEASURE ON A PHONE:
+// - EMF / magnetic field: phones have a real magnetometer (used for the
+//   compass). We read it live and track deviation from a rolling baseline —
+//   ambient field varies a lot by location (near rebar, wiring, appliances),
+//   so "anomaly vs. your own baseline" is the honest signal, not an
+//   absolute threshold. This detects magnetic/electrical anomalies; it is
+//   not a certified "bug detector," the same way commercial EMF meters
+//   aren't — a fridge motor or laptop charger will also spike it.
+// - RF: a phone has no general-purpose RF spectrum receiver, so it cannot
+//   scan "RF" in the abstract. What it CAN genuinely do is Bluetooth Low
+//   Energy scanning — real nearby BLE devices with real measured RSSI. We
+//   use that for the "signal strength" and radar-blip data, and flag
+//   devices that are unnamed, strong-signal, and persistently present
+//   (the same category of heuristic Apple/Google's own "unknown tracker"
+//   alerts use) as worth a manual look.
+// - WiFi shows real "connected" status, not a spectrum scan.
+// - Zigbee and Z-Wave use radios phones simply don't have — there is no
+//   API and no hardware, on any phone, for an app to detect them. We keep
+//   them visible in the protocol list but mark them as unsupported by the
+//   hardware rather than pretending to scan for them.
+// - BLE gives no bearing/direction, only approximate proximity from RSSI.
+//   Radar blip *angle* is therefore arbitrary (stable per-device, not a
+//   real compass bearing) — only the *radial distance* loosely reflects
+//   measured signal strength. Distance-in-meters is a rough RSSI-based
+//   estimate (standard log-distance path-loss formula) that can easily be
+//   off by several meters indoors — walls, orientation, and multipath all
+//   affect it.
+
 // ── Radar Canvas ─────────────────────────────────────────────────
+/// One real detected BLE device, reduced to what the radar can honestly
+/// display: a stable ID (for a consistent on-screen position), a normalized
+/// proximity distance (0 = strong/near, 1 = weak/far — derived from real
+/// RSSI), and whether our heuristic flags it as worth a closer look.
+class RadarDevice {
+  final String id;
+  final double distance01;
+  final bool suspicious;
+
+  const RadarDevice({
+    required this.id,
+    required this.distance01,
+    required this.suspicious,
+  });
+}
+
 class RadarCanvas extends StatefulWidget {
   final double size;
+  final List<RadarDevice> devices;
 
-  const RadarCanvas({super.key, required this.size});
+  const RadarCanvas({super.key, required this.size, this.devices = const []});
 
   @override
   State<RadarCanvas> createState() => _RadarCanvasState();
@@ -28,20 +79,46 @@ class _RadarCanvasState extends State<RadarCanvas>
           _angle = (_angle + 1.4) % 360;
         });
       });
-    
-    final random = Random();
-    _blips = List.generate(6, (_) {
-      final a = random.nextDouble() * 2 * pi;
-      final d = (0.3 + random.nextDouble() * 0.6) * (widget.size / 2 - 4);
-      return _Blip(
-        x: widget.size / 2 + cos(a) * d,
-        y: widget.size / 2 + sin(a) * d,
-        age: random.nextDouble() * 360,
-        r: 2 + random.nextDouble() * 2,
-      );
-    });
-    
+
+    _rebuildBlips();
     _controller.repeat();
+  }
+
+  @override
+  void didUpdateWidget(covariant RadarCanvas oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_sameDevices(oldWidget.devices, widget.devices)) {
+      _rebuildBlips();
+    }
+  }
+
+  bool _sameDevices(List<RadarDevice> a, List<RadarDevice> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i].id != b[i].id ||
+          (a[i].distance01 - b[i].distance01).abs() > 0.02 ||
+          a[i].suspicious != b[i].suspicious) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void _rebuildBlips() {
+    // Real BLE scans carry no bearing — only proximity. Each device gets a
+    // stable angle derived from its own ID (so it doesn't jitter around the
+    // dial between refreshes); only the radial distance is a real signal.
+    _blips = widget.devices.map((d) {
+      final angleSeed = (d.id.hashCode.abs() % 360) * pi / 180;
+      final r = (0.15 + d.distance01.clamp(0.0, 1.0) * 0.8) * (widget.size / 2 - 4);
+      return _Blip(
+        x: widget.size / 2 + cos(angleSeed) * r,
+        y: widget.size / 2 + sin(angleSeed) * r,
+        age: (d.id.hashCode.abs() % 360).toDouble(),
+        r: d.suspicious ? 4.5 : 2.5,
+        suspicious: d.suspicious,
+      );
+    }).toList();
   }
 
   @override
@@ -65,7 +142,14 @@ class _RadarCanvasState extends State<RadarCanvas>
 
 class _Blip {
   final double x, y, age, r;
-  _Blip({required this.x, required this.y, required this.age, required this.r});
+  final bool suspicious;
+  _Blip({
+    required this.x,
+    required this.y,
+    required this.age,
+    required this.r,
+    this.suspicious = false,
+  });
 }
 
 class RadarPainter extends CustomPainter {
@@ -156,9 +240,10 @@ class RadarPainter extends CustomPainter {
       final diff = ((angle - blip.age) % 360 + 360) % 360;
       if (diff < 180) {
         final fade = 1 - diff / 180;
-        paint.color = const Color(0xFF00FF66).withOpacity(fade);
+        final blipColor = blip.suspicious ? const Color(0xFFFF2244) : const Color(0xFF00FF66);
+        paint.color = blipColor.withOpacity(fade);
         paint.style = PaintingStyle.fill;
-        paint.maskFilter = MaskFilter.blur(BlurStyle.normal, 8 * fade);
+        paint.maskFilter = MaskFilter.blur(BlurStyle.normal, (blip.suspicious ? 12 : 8) * fade);
         canvas.drawCircle(
           Offset(blip.x, blip.y),
           blip.r,
@@ -339,7 +424,15 @@ class NeedleGaugePainter extends CustomPainter {
   bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
 }
 
-// ── Signal bar strip ─────────────────────────────────────────────
+class _BleTrack {
+  final String id;
+  String? name;
+  int rssi = -100;
+  DateTime lastSeen = DateTime.now();
+  int hitStreak = 0;
+
+  _BleTrack({required this.id});
+}
 class SignalBars extends StatelessWidget {
   final int dbm;
 
@@ -399,14 +492,31 @@ class RadarScreen extends StatefulWidget {
 
 class _RadarScreenState extends State<RadarScreen>
     with SingleTickerProviderStateMixin {
-  double _emf = 22;
-  int _dbm = -58;
-  double _microtesla = 12.4;
+  // EMF — real magnetometer readings.
+  double _magnitudeUt = 0; // latest |B| field magnitude, microtesla
+  double _emfGauge = 15; // 0-100, mapped for the needle display only
+  final List<double> _magBaselineWindow = [];
+  static const int _magBaselineSize = 40; // ~ rolling ambient baseline
+  StreamSubscription<MagnetometerEvent>? _magSub;
+
+  // BLE — real nearby-device scan.
+  bool _bleAvailable = true;
+  bool _bleScanning = false;
+  StreamSubscription<List<ScanResult>>? _bleResultsSub;
+  final Map<String, _BleTrack> _bleTracks = {};
+  Timer? _bleRestartTimer;
+
+  bool _wifiConnected = false;
+  int _dbm = -100;
+
   bool _scanning = true;
   int _threatCount = 0;
   String _scanStatus = 'SCANNING';
   double _radarSize = 240;
   late AnimationController _pulseController;
+
+  final AudioPlayer _beepPlayer = AudioPlayer();
+  DateTime? _lastBeepAt;
 
   @override
   void initState() {
@@ -415,46 +525,243 @@ class _RadarScreenState extends State<RadarScreen>
       vsync: this,
       duration: const Duration(seconds: 3),
     )..repeat();
-    
-    _simulateData();
+
+    _checkWifi();
+    _startMagnetometer();
+    _startBleScanning();
   }
 
   @override
   void dispose() {
     _pulseController.dispose();
+    _magSub?.cancel();
+    _bleResultsSub?.cancel();
+    _bleRestartTimer?.cancel();
+    if (_bleScanning) {
+      FlutterBluePlus.stopScan();
+    }
+    _beepPlayer.dispose();
     super.dispose();
   }
 
-  void _simulateData() {
-    if (!_scanning) return;
-    Future.delayed(const Duration(milliseconds: 900), () {
+  Future<void> _checkWifi() async {
+    try {
+      final ip = await NetworkInfo().getWifiIP();
+      if (mounted) setState(() => _wifiConnected = ip != null && ip.isNotEmpty);
+    } catch (_) {
+      if (mounted) setState(() => _wifiConnected = false);
+    }
+  }
+
+  // ── Magnetometer (real EMF) ──────────────────────────────────────
+  void _startMagnetometer() {
+    _magSub?.cancel();
+    _magSub = magnetometerEventStream().listen((event) {
+      final magnitude = sqrt(
+        event.x * event.x + event.y * event.y + event.z * event.z,
+      );
+
+      _magBaselineWindow.add(magnitude);
+      if (_magBaselineWindow.length > _magBaselineSize) {
+        _magBaselineWindow.removeAt(0);
+      }
+
       if (!mounted) return;
-      final spike = Random().nextDouble() < 0.08;
-      final newEmf = spike ? 75 + Random().nextDouble() * 20 : 15 + Random().nextDouble() * 30;
       setState(() {
-        _emf = newEmf;
-        _microtesla = 2 + Random().nextDouble() * (spike ? 60 : 20);
-        _dbm = -40 - Random().nextInt(55);
-        
-        if (spike) {
-          _threatCount++;
-          _scanStatus = 'THREAT DETECTED';
-          Future.delayed(const Duration(milliseconds: 2200), () {
-            if (mounted) {
-              setState(() {
-                _scanStatus = 'SCANNING';
-              });
-            }
-          });
+        _magnitudeUt = magnitude;
+        _emfGauge = _mapMagnitudeToGauge(magnitude);
+      });
+      _evaluateThreat();
+    }, onError: (e) {
+      debugPrint('Magnetometer unavailable: $e');
+    });
+  }
+
+  double _mapMagnitudeToGauge(double ut) {
+    // Ambient Earth field is roughly 25-65 µT; this stretches that range
+    // (plus headroom for real anomalies) onto the 0-100 dial. Display
+    // convenience only — the µT figure shown alongside it is the real
+    // sensor reading.
+    return ((ut - 20) / 150 * 100).clamp(0, 100);
+  }
+
+  bool _isEmfAnomaly() {
+    if (_magBaselineWindow.length < 10) return false; // not enough baseline yet
+    final baseline =
+        _magBaselineWindow.reduce((a, b) => a + b) / _magBaselineWindow.length;
+    // Require the current reading to clear the baseline by a meaningful
+    // margin, not just noise — real spikes from nearby active electronics
+    // are usually large relative to the ambient level.
+    final threshold = baseline + max(15.0, baseline * 0.5);
+    return _magnitudeUt > threshold;
+  }
+
+  // ── Bluetooth LE (real nearby-device scan) ───────────────────────
+  Future<void> _startBleScanning() async {
+    if (!_scanning) return;
+    try {
+      if (await FlutterBluePlus.isSupported == false) {
+        if (mounted) setState(() => _bleAvailable = false);
+        return;
+      }
+
+      final granted = await _ensureBlePermissions();
+      if (!granted) {
+        if (mounted) setState(() => _bleAvailable = false);
+        return;
+      }
+
+      _bleResultsSub?.cancel();
+      _bleResultsSub = FlutterBluePlus.scanResults.listen(_onBleResults);
+
+      if (mounted) setState(() => _bleScanning = true);
+      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
+
+      // Re-arm the next sweep shortly after this one ends, as long as
+      // we're still in "scanning" mode.
+      _bleRestartTimer?.cancel();
+      _bleRestartTimer = Timer(const Duration(seconds: 6), () {
+        if (mounted && _scanning) _startBleScanning();
+      });
+    } catch (e) {
+      debugPrint('BLE scan error: $e');
+      if (mounted) setState(() => _bleAvailable = false);
+      _bleRestartTimer?.cancel();
+      _bleRestartTimer = Timer(const Duration(seconds: 8), () {
+        if (mounted && _scanning) _startBleScanning();
+      });
+    }
+  }
+
+  Future<bool> _ensureBlePermissions() async {
+    // Android 12+ needs runtime BLUETOOTH_SCAN/CONNECT; older Android ties
+    // BLE scan results to location permission. iOS handles its own
+    // system prompt from NSBluetoothAlwaysUsageDescription in Info.plist.
+    try {
+      final statuses = await [
+        Permission.bluetoothScan,
+        Permission.bluetoothConnect,
+        Permission.locationWhenInUse,
+      ].request();
+      // Not every platform/OS version requires every one of these — treat
+      // it as granted as long as nothing came back explicitly denied.
+      return !statuses.values.any((s) => s.isPermanentlyDenied || s.isDenied);
+    } catch (_) {
+      return true; // permission_handler channel may be a no-op on some platforms; let the scan attempt surface the real error
+    }
+  }
+
+  void _onBleResults(List<ScanResult> results) {
+    final now = DateTime.now();
+    for (final r in results) {
+      final id = r.device.remoteId.str;
+      final advertisedName = r.advertisementData.advName;
+      final name = advertisedName.isNotEmpty
+          ? advertisedName
+          : (r.device.platformName.isNotEmpty ? r.device.platformName : null);
+
+      final track = _bleTracks.putIfAbsent(id, () => _BleTrack(id: id));
+      track.name = name;
+      track.rssi = r.rssi;
+      track.lastSeen = now;
+      track.hitStreak++;
+    }
+
+    // Drop anything we haven't seen in a while so the list reflects what's
+    // actually around right now, not a permanent log.
+    _bleTracks.removeWhere(
+      (_, t) => now.difference(t.lastSeen) > const Duration(seconds: 30),
+    );
+
+    if (!mounted) return;
+    setState(() {
+      if (_bleTracks.isNotEmpty) {
+        final nearest =
+            _bleTracks.values.reduce((a, b) => a.rssi >= b.rssi ? a : b);
+        _dbm = nearest.rssi;
+      }
+    });
+    _evaluateThreat();
+  }
+
+  /// A device is flagged "suspicious" — worth a manual look, not proof of
+  /// anything — when it broadcasts no name, sits at a strong/close RSSI,
+  /// and has shown up consistently rather than just once. This mirrors the
+  /// category of heuristic behind Apple/Google's own "unknown tracker"
+  /// alerts, not a from-scratch invention.
+  List<_BleTrack> _suspiciousBleDevices() {
+    return _bleTracks.values
+        .where((t) => t.name == null && t.rssi > -65 && t.hitStreak >= 3)
+        .toList();
+  }
+
+  double? _estimateDistanceMeters(int rssi) {
+    // Standard log-distance path-loss estimate. measuredPower is a typical
+    // "RSSI at 1 meter" calibration constant for BLE — real devices vary,
+    // and walls/orientation/multipath mean this can be off by several
+    // meters indoors. Treat it as "closer / farther," not a tape measure.
+    const measuredPower = -59.0;
+    const pathLossExponent = 2.0;
+    if (rssi == 0) return null;
+    return pow(10, (measuredPower - rssi) / (10 * pathLossExponent)).toDouble();
+  }
+
+  void _evaluateThreat() {
+    if (!mounted) return;
+    final suspicious = _suspiciousBleDevices();
+    final emfAnomaly = _isEmfAnomaly();
+    final isThreat = suspicious.isNotEmpty || emfAnomaly;
+
+    if (isThreat && _scanStatus != 'BUG DETECTED') {
+      setState(() {
+        _threatCount++;
+        _scanStatus = 'BUG DETECTED';
+      });
+      _playBeep();
+      Future.delayed(const Duration(milliseconds: 2200), () {
+        if (mounted && _scanStatus == 'BUG DETECTED') {
+          setState(() => _scanStatus = 'SCANNING');
         }
       });
-      _simulateData();
-    });
+    }
+  }
+
+  Future<void> _playBeep() async {
+    final now = DateTime.now();
+    if (_lastBeepAt != null && now.difference(_lastBeepAt!) < const Duration(seconds: 2)) {
+      return; // debounce so a run of detections doesn't overlap beeps
+    }
+    _lastBeepAt = now;
+    try {
+      await _beepPlayer.stop();
+      await _beepPlayer.play(AssetSource('sounds/beep.wav'));
+    } catch (e) {
+      debugPrint('Beep playback failed: $e');
+    }
+  }
+
+  List<RadarDevice> get _radarDevices {
+    return _bleTracks.values.map((t) {
+      final proximity = ((t.rssi + 100) / 70).clamp(0.0, 1.0); // 1 = very close
+      return RadarDevice(
+        id: t.id,
+        distance01: 1 - proximity,
+        suspicious: _suspiciousBleDevices().any((s) => s.id == t.id),
+      );
+    }).toList();
+  }
+
+  String get _nearestRangeLabel {
+    if (_bleTracks.isEmpty) return '--';
+    final nearest = _bleTracks.values.reduce((a, b) => a.rssi >= b.rssi ? a : b);
+    final meters = _estimateDistanceMeters(nearest.rssi);
+    if (meters == null) return '--';
+    return meters.toStringAsFixed(1);
   }
 
   @override
   Widget build(BuildContext context) {
-    final isAlert = _scanStatus == 'THREAT DETECTED';
+    final isAlert = _scanStatus == 'BUG DETECTED';
     final screenWidth = MediaQuery.of(context).size.width;
     final radarSize = min(screenWidth - 32, 260.0);
 
@@ -564,7 +871,7 @@ class _RadarScreenState extends State<RadarScreen>
                         );
                       },
                     ),
-                  RadarCanvas(size: radarSize),
+                  RadarCanvas(size: radarSize, devices: _radarDevices),
                 ],
               ),
             ),
@@ -578,7 +885,7 @@ class _RadarScreenState extends State<RadarScreen>
                   const SizedBox(width: 6),
                   _buildStatCard('FREQ', '2.4', 'GHz'),
                   const SizedBox(width: 6),
-                  _buildStatCard('RANGE', '15', 'm'),
+                  _buildStatCard('RANGE', _nearestRangeLabel, 'm'),
                 ],
               ),
             ),
@@ -626,7 +933,7 @@ class _RadarScreenState extends State<RadarScreen>
                               ),
                             ),
                             Text(
-                              '${_microtesla.toStringAsFixed(1)} μT',
+                              '${_magnitudeUt.toStringAsFixed(1)} μT',
                               style: TextStyle(
                                 fontSize: 11,
                                 fontWeight: FontWeight.w700,
@@ -639,7 +946,7 @@ class _RadarScreenState extends State<RadarScreen>
                           ],
                         ),
                         const SizedBox(height: 4),
-                        NeedleGauge(value: _emf),
+                        NeedleGauge(value: _emfGauge),
                         Padding(
                           padding: const EdgeInsets.only(top: 4),
                           child: Row(
@@ -782,10 +1089,14 @@ class _RadarScreenState extends State<RadarScreen>
                                 ),
                               ),
                               const SizedBox(height: 10),
-                              ...['WiFi 6', 'BT 5.3', 'Zigbee', 'Z-Wave'].asMap().entries.map((entry) {
+                              ...['WiFi', 'Bluetooth LE', 'Zigbee', 'Z-Wave'].asMap().entries.map((entry) {
                                 final index = entry.key;
                                 final name = entry.value;
-                                final active = index < 2;
+                                // Real status for WiFi/BLE; phones have no
+                                // Zigbee/Z-Wave radio at all, so those two
+                                // are always shown inactive rather than
+                                // faked as scannable.
+                                final active = index == 0 ? _wifiConnected : (index == 1 ? _bleScanning : false);
                                 return Padding(
                                   padding: const EdgeInsets.only(bottom: 6),
                                   child: Row(
@@ -820,6 +1131,17 @@ class _RadarScreenState extends State<RadarScreen>
                                   ),
                                 );
                               }),
+                              Padding(
+                                padding: const EdgeInsets.only(top: 2),
+                                child: Text(
+                                  'Zigbee/Z-Wave: no phone radio support',
+                                  style: TextStyle(
+                                    fontSize: 7,
+                                    color: Colors.white.withOpacity(0.18),
+                                    letterSpacing: 0.3,
+                                  ),
+                                ),
+                              ),
                             ],
                           ),
                         ),
@@ -857,10 +1179,17 @@ class _RadarScreenState extends State<RadarScreen>
                                   onPressed: () {
                                     setState(() {
                                       _scanning = !_scanning;
-                                      if (_scanning) {
-                                        _simulateData();
-                                      }
                                     });
+                                    if (_scanning) {
+                                      _startMagnetometer();
+                                      _startBleScanning();
+                                    } else {
+                                      _magSub?.cancel();
+                                      _bleResultsSub?.cancel();
+                                      _bleRestartTimer?.cancel();
+                                      if (_bleScanning) FlutterBluePlus.stopScan();
+                                      setState(() => _bleScanning = false);
+                                    }
                                   },
                                   style: ElevatedButton.styleFrom(
                                     backgroundColor: _scanning
@@ -893,7 +1222,9 @@ class _RadarScreenState extends State<RadarScreen>
                               const SizedBox(height: 6),
                               Center(
                                 child: Text(
-                                  _scanning ? 'ACTIVE SWEEP' : 'PAUSED',
+                                  _scanning
+                                      ? (_bleAvailable ? 'ACTIVE SWEEP' : 'BLE UNAVAILABLE')
+                                      : 'PAUSED',
                                   style: TextStyle(
                                     fontSize: 8,
                                     color: Colors.white.withOpacity(0.2),
